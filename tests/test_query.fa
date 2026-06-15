@@ -1,0 +1,4 @@
+>seq1 Test query sequence
+ATCGATCGATCGATCG
+>seq2 Another query with N bases
+ATCGNTCGATCGATCG
