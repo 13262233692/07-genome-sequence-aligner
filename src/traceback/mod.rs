@@ -1,7 +1,11 @@
-use crate::align::{AlignmentResult, DPMatrix, TraceDirection};
+use crate::align::{AlignmentResult, GenericDPMatrix, Score, TraceDirection};
 use crate::fasta::Base;
 
-pub fn traceback(matrix: &DPMatrix, query: &[Base], target: &[Base]) -> AlignmentResult {
+pub fn traceback_generic<S: Score>(
+    matrix: &GenericDPMatrix<S>,
+    query: &[Base],
+    target: &[Base],
+) -> AlignmentResult {
     let mut i = matrix.rows - 1;
     let mut j = matrix.cols - 1;
 
@@ -52,10 +56,10 @@ pub fn traceback(matrix: &DPMatrix, query: &[Base], target: &[Base]) -> Alignmen
     target_aligned.reverse();
 
     let cigar = build_cigar(&query_aligned, &target_aligned);
-    let score = matrix.get_score(matrix.rows - 1, matrix.cols - 1);
+    let score_i64: i64 = matrix.get_score(matrix.rows - 1, matrix.cols - 1).into();
 
     AlignmentResult {
-        score,
+        score: score_i64,
         query_aligned,
         target_aligned,
         cigar,
@@ -63,6 +67,14 @@ pub fn traceback(matrix: &DPMatrix, query: &[Base], target: &[Base]) -> Alignmen
         insertions,
         deletions,
     }
+}
+
+pub fn traceback(
+    matrix: &crate::align::DPMatrix,
+    query: &[Base],
+    target: &[Base],
+) -> AlignmentResult {
+    traceback_generic::<i32>(matrix, query, target)
 }
 
 fn build_cigar(query_aligned: &[u8], target_aligned: &[u8]) -> String {
@@ -93,4 +105,64 @@ fn build_cigar(query_aligned: &[u8], target_aligned: &[u8]) -> String {
     }
 
     cigar
+}
+
+pub fn build_result_from_edits(
+    edits: &[EditOp],
+    query: &[Base],
+    target: &[Base],
+) -> AlignmentResult {
+    let mut query_aligned = Vec::new();
+    let mut target_aligned = Vec::new();
+    let mut mismatches = 0u32;
+    let mut insertions = 0u32;
+    let mut deletions = 0u32;
+
+    let mut qi = 0;
+    let mut ti = 0;
+
+    for op in edits {
+        match op {
+            EditOp::Match(b) => {
+                query_aligned.push(query[qi].to_byte());
+                target_aligned.push(target[ti].to_byte());
+                if !*b {
+                    mismatches += 1;
+                }
+                qi += 1;
+                ti += 1;
+            }
+            EditOp::Insertion => {
+                query_aligned.push(query[qi].to_byte());
+                target_aligned.push(b'-');
+                insertions += 1;
+                qi += 1;
+            }
+            EditOp::Deletion => {
+                query_aligned.push(b'-');
+                target_aligned.push(target[ti].to_byte());
+                deletions += 1;
+                ti += 1;
+            }
+        }
+    }
+
+    let cigar = build_cigar(&query_aligned, &target_aligned);
+
+    AlignmentResult {
+        score: 0,
+        query_aligned,
+        target_aligned,
+        cigar,
+        mismatches,
+        insertions,
+        deletions,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditOp {
+    Match(bool),
+    Insertion,
+    Deletion,
 }

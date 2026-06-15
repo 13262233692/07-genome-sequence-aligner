@@ -1,13 +1,13 @@
 #[cfg(target_arch = "x86_64")]
 pub mod avx2 {
-    use crate::align::{score_pair, AlignmentConfig, DPMatrix, TraceDirection};
+    use crate::align::{score_pair, AlignmentConfig, GenericDPMatrix, TraceDirection};
     use crate::fasta::Base;
     use std::arch::x86_64::*;
 
     #[inline]
     #[target_feature(enable = "avx2")]
     pub unsafe fn fill_row_simd(
-        matrix: &mut DPMatrix,
+        matrix: &mut GenericDPMatrix<i32>,
         i: usize,
         query: &[Base],
         target: &[Base],
@@ -43,7 +43,7 @@ pub mod avx2 {
             let left_base = *row_scores_ptr.add(j - 1);
             let mut left_arr = [left_base; 8];
             for k in 0..7 {
-                left_arr[k + 1] = left_arr[k] + gap_ext;
+                left_arr[k + 1] = left_arr[k].saturating_add(gap_ext);
             }
             let left_vec = _mm256_loadu_si256(left_arr.as_ptr() as *const __m256i);
 
@@ -83,9 +83,10 @@ pub mod avx2 {
         }
 
         while j < j_end {
-            let diag = *prev_row_scores_ptr.add(j - 1) + score_pair(q_base, target[j - 1], config);
-            let up = *prev_row_scores_ptr.add(j) + gap_ext;
-            let left = *row_scores_ptr.add(j - 1) + gap_ext;
+            let sp = score_pair(q_base, target[j - 1], config);
+            let diag = (*prev_row_scores_ptr.add(j - 1)).saturating_add(sp);
+            let up = (*prev_row_scores_ptr.add(j)).saturating_add(gap_ext);
+            let left = (*row_scores_ptr.add(j - 1)).saturating_add(gap_ext);
 
             let (best_score, best_dir) = if diag >= up && diag >= left {
                 (diag, TraceDirection::Diagonal)
