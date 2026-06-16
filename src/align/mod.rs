@@ -3,10 +3,27 @@ use std::fmt::Debug;
 use std::ops::{Add, Sub};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TraceDirection {
-    Diagonal,
-    Up,
-    Left,
+pub enum AffineState {
+    Match,
+    Insert,
+    Delete,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TraceDirection {
+    pub state: AffineState,
+}
+
+impl TraceDirection {
+    pub fn new_match() -> Self {
+        TraceDirection { state: AffineState::Match }
+    }
+    pub fn new_insert() -> Self {
+        TraceDirection { state: AffineState::Insert }
+    }
+    pub fn new_delete() -> Self {
+        TraceDirection { state: AffineState::Delete }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -132,8 +149,12 @@ impl AlignmentConfig {
 
     pub fn required_score_kind(&self, query_len: usize, target_len: usize) -> ScoreKind {
         let max_len = query_len.max(target_len) as i64;
-        let max_possible = (self.match_score as i64) * max_len;
-        let min_possible = (self.gap_extend_penalty as i64) * max_len;
+        let match_s = self.match_score as i64;
+        let ext = self.gap_extend_penalty as i64;
+        let open = self.gap_open_penalty as i64;
+        let min_per_step = if ext < open { ext } else { open };
+        let max_possible = match_s * max_len;
+        let min_possible = min_per_step * max_len;
 
         if max_possible <= i16::MAX as i64 && min_possible >= i16::MIN as i64 {
             ScoreKind::I16
@@ -158,7 +179,9 @@ pub fn score_pair(a: Base, b: Base, config: &AlignmentConfig) -> i32 {
 }
 
 pub struct GenericDPMatrix<S: Score> {
-    pub scores: Vec<S>,
+    pub mat_m: Vec<S>,
+    pub mat_x: Vec<S>,
+    pub mat_y: Vec<S>,
     pub traceback: Vec<TraceDirection>,
     pub rows: usize,
     pub cols: usize,
@@ -168,8 +191,10 @@ impl<S: Score> GenericDPMatrix<S> {
     pub fn new(rows: usize, cols: usize) -> Self {
         let size = rows * cols;
         GenericDPMatrix {
-            scores: vec![S::from_i32(0); size],
-            traceback: vec![TraceDirection::Diagonal; size],
+            mat_m: vec![S::from_i32(0); size],
+            mat_x: vec![S::from_i32(0); size],
+            mat_y: vec![S::from_i32(0); size],
+            traceback: vec![TraceDirection::new_match(); size],
             rows,
             cols,
         }
@@ -183,21 +208,52 @@ impl<S: Score> GenericDPMatrix<S> {
     }
 
     #[inline]
-    pub fn get_score(&self, i: usize, j: usize) -> S {
-        self.scores[self.idx(i, j)]
+    pub fn get_m(&self, i: usize, j: usize) -> S {
+        self.mat_m[self.idx(i, j)]
+    }
+    #[inline]
+    pub fn set_m(&mut self, i: usize, j: usize, val: S) {
+        let idx = self.idx(i, j);
+        self.mat_m[idx] = val;
+    }
+    #[inline]
+    pub fn get_x(&self, i: usize, j: usize) -> S {
+        self.mat_x[self.idx(i, j)]
+    }
+    #[inline]
+    pub fn set_x(&mut self, i: usize, j: usize, val: S) {
+        let idx = self.idx(i, j);
+        self.mat_x[idx] = val;
+    }
+    #[inline]
+    pub fn get_y(&self, i: usize, j: usize) -> S {
+        self.mat_y[self.idx(i, j)]
+    }
+    #[inline]
+    pub fn set_y(&mut self, i: usize, j: usize, val: S) {
+        let idx = self.idx(i, j);
+        self.mat_y[idx] = val;
     }
 
     #[inline]
-    pub fn set_score(&mut self, i: usize, j: usize, val: S) {
-        let idx = self.idx(i, j);
-        self.scores[idx] = val;
+    pub fn get_score(&self, i: usize, j: usize) -> S {
+        let k = self.idx(i, j);
+        let m = self.mat_m[k];
+        let x = self.mat_x[k];
+        let y = self.mat_y[k];
+        if m >= x && m >= y {
+            m
+        } else if x >= y {
+            x
+        } else {
+            y
+        }
     }
 
     #[inline]
     pub fn get_trace(&self, i: usize, j: usize) -> TraceDirection {
         self.traceback[self.idx(i, j)]
     }
-
     #[inline]
     pub fn set_trace(&mut self, i: usize, j: usize, dir: TraceDirection) {
         let idx = self.idx(i, j);
@@ -232,15 +288,9 @@ pub fn needleman_wunsch(
     }
 
     match config.required_score_kind(m, n) {
-        ScoreKind::I16 => {
-            run_generic_nw::<i16>(query, target, config)
-        }
-        ScoreKind::I32 => {
-            run_generic_nw::<i32>(query, target, config)
-        }
-        ScoreKind::I64 => {
-            run_generic_nw::<i64>(query, target, config)
-        }
+        ScoreKind::I16 => run_generic_nw::<i16>(query, target, config),
+        ScoreKind::I32 => run_generic_nw::<i32>(query, target, config),
+        ScoreKind::I64 => run_generic_nw::<i64>(query, target, config),
     }
 }
 
@@ -254,16 +304,23 @@ fn run_generic_nw<S: Score>(
 
     let mut matrix = GenericDPMatrix::<S>::new(m, n);
     let gap_open = S::from_i32(config.gap_open_penalty);
+    let inf = S::MIN.saturating_add(S::from_i32(1000));
+
+    matrix.set_m(0, 0, S::from_i32(0));
+    matrix.set_x(0, 0, inf);
+    matrix.set_y(0, 0, inf);
 
     for i in 1..m {
-        let val = gap_open.saturating_add(S::from_i32((i as i32 - 1) * config.gap_extend_penalty));
-        matrix.set_score(i, 0, val);
-        matrix.set_trace(i, 0, TraceDirection::Up);
+        matrix.set_m(i, 0, inf);
+        matrix.set_x(i, 0, gap_open.saturating_add(S::from_i32(i as i32 * config.gap_extend_penalty)));
+        matrix.set_y(i, 0, inf);
+        matrix.set_trace(i, 0, TraceDirection::new_insert());
     }
     for j in 1..n {
-        let val = gap_open.saturating_add(S::from_i32((j as i32 - 1) * config.gap_extend_penalty));
-        matrix.set_score(0, j, val);
-        matrix.set_trace(0, j, TraceDirection::Left);
+        matrix.set_m(0, j, inf);
+        matrix.set_x(0, j, inf);
+        matrix.set_y(0, j, gap_open.saturating_add(S::from_i32(j as i32 * config.gap_extend_penalty)));
+        matrix.set_trace(0, j, TraceDirection::new_delete());
     }
 
     let use_simd = std::is_x86_feature_detected!("avx2") && n > 32 && S::KIND == ScoreKind::I32;
@@ -302,24 +359,46 @@ fn fill_row_scalar<S: Score>(
 ) {
     let q_base = query[i - 1];
     let cols = matrix.cols;
+    let gap_open = S::from_i32(config.gap_open_penalty);
     let gap_ext = S::from_i32(config.gap_extend_penalty);
+    let open_plus_ext = gap_open.saturating_add(gap_ext);
 
     for j in 1..cols {
         let sp = score_pair(q_base, target[j - 1], config);
-        let diag = matrix.get_score(i - 1, j - 1).saturating_add(S::from_i32(sp));
-        let up = matrix.get_score(i - 1, j).saturating_add(gap_ext);
-        let left = matrix.get_score(i, j - 1).saturating_add(gap_ext);
+        let s = S::from_i32(sp);
 
-        let (best_score, best_dir) = if diag >= up && diag >= left {
-            (diag, TraceDirection::Diagonal)
-        } else if up >= left {
-            (up, TraceDirection::Up)
+        let m_prev = matrix.get_m(i - 1, j - 1);
+        let x_prev = matrix.get_x(i - 1, j - 1);
+        let y_prev = matrix.get_y(i - 1, j - 1);
+        let match_from = if m_prev >= x_prev && m_prev >= y_prev {
+            m_prev
+        } else if x_prev >= y_prev {
+            x_prev
         } else {
-            (left, TraceDirection::Left)
+            y_prev
+        };
+        let m_new = match_from.saturating_add(s);
+
+        let m_up = matrix.get_m(i - 1, j).saturating_add(open_plus_ext);
+        let x_up = matrix.get_x(i - 1, j).saturating_add(gap_ext);
+        let x_new = if m_up >= x_up { m_up } else { x_up };
+
+        let m_left = matrix.get_m(i, j - 1).saturating_add(open_plus_ext);
+        let y_left = matrix.get_y(i, j - 1).saturating_add(gap_ext);
+        let y_new = if m_left >= y_left { m_left } else { y_left };
+
+        let best_state = if m_new >= x_new && m_new >= y_new {
+            AffineState::Match
+        } else if x_new >= y_new {
+            AffineState::Insert
+        } else {
+            AffineState::Delete
         };
 
-        matrix.set_score(i, j, best_score);
-        matrix.set_trace(i, j, best_dir);
+        matrix.set_m(i, j, m_new);
+        matrix.set_x(i, j, x_new);
+        matrix.set_y(i, j, y_new);
+        matrix.set_trace(i, j, TraceDirection { state: best_state });
     }
 }
 

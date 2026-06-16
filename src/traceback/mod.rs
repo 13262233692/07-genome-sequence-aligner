@@ -1,4 +1,4 @@
-use crate::align::{AlignmentResult, GenericDPMatrix, Score, TraceDirection};
+use crate::align::{AffineState, AlignmentResult, GenericDPMatrix, Score};
 use crate::fasta::Base;
 
 pub fn traceback_generic<S: Score>(
@@ -6,8 +6,22 @@ pub fn traceback_generic<S: Score>(
     query: &[Base],
     target: &[Base],
 ) -> AlignmentResult {
-    let mut i = matrix.rows - 1;
-    let mut j = matrix.cols - 1;
+    let m = matrix.rows - 1;
+    let n = matrix.cols - 1;
+
+    let end_m = matrix.get_m(m, n);
+    let end_x = matrix.get_x(m, n);
+    let end_y = matrix.get_y(m, n);
+    let mut state = if end_m >= end_x && end_m >= end_y {
+        AffineState::Match
+    } else if end_x >= end_y {
+        AffineState::Insert
+    } else {
+        AffineState::Delete
+    };
+
+    let mut i = m;
+    let mut j = n;
 
     let mut query_aligned = Vec::new();
     let mut target_aligned = Vec::new();
@@ -17,16 +31,13 @@ pub fn traceback_generic<S: Score>(
     let mut deletions = 0u32;
 
     while i > 0 || j > 0 {
-        let dir = if i > 0 && j > 0 {
-            matrix.get_trace(i, j)
-        } else if i > 0 {
-            TraceDirection::Up
-        } else {
-            TraceDirection::Left
-        };
-
-        match dir {
-            TraceDirection::Diagonal => {
+        if i > 0 && j == 0 {
+            state = AffineState::Insert;
+        } else if i == 0 && j > 0 {
+            state = AffineState::Delete;
+        }
+        match state {
+            AffineState::Match => {
                 let q_base = query[i - 1];
                 let t_base = target[j - 1];
                 query_aligned.push(q_base.to_byte());
@@ -34,19 +45,58 @@ pub fn traceback_generic<S: Score>(
                 if q_base != t_base {
                     mismatches += 1;
                 }
+                if i > 1 && j > 1 {
+                    let prev_m = matrix.get_m(i - 1, j - 1);
+                    let prev_x = matrix.get_x(i - 1, j - 1);
+                    let prev_y = matrix.get_y(i - 1, j - 1);
+                    state = if prev_m >= prev_x && prev_m >= prev_y {
+                        AffineState::Match
+                    } else if prev_x >= prev_y {
+                        AffineState::Insert
+                    } else {
+                        AffineState::Delete
+                    };
+                } else if i == 1 && j == 1 {
+                } else if i > 0 && j == 0 {
+                    state = AffineState::Insert;
+                } else {
+                    state = AffineState::Delete;
+                }
                 i -= 1;
                 j -= 1;
             }
-            TraceDirection::Up => {
+            AffineState::Insert => {
                 query_aligned.push(query[i - 1].to_byte());
                 target_aligned.push(b'-');
                 insertions += 1;
+                if i > 1 {
+                    let m_up = matrix.get_m(i - 1, j);
+                    let x_up = matrix.get_x(i - 1, j);
+                    if x_up >= m_up {
+                        state = AffineState::Insert;
+                    } else {
+                        state = AffineState::Match;
+                    }
+                } else if j > 0 {
+                    state = AffineState::Delete;
+                }
                 i -= 1;
             }
-            TraceDirection::Left => {
+            AffineState::Delete => {
                 query_aligned.push(b'-');
                 target_aligned.push(target[j - 1].to_byte());
                 deletions += 1;
+                if j > 1 {
+                    let m_left = matrix.get_m(i, j - 1);
+                    let y_left = matrix.get_y(i, j - 1);
+                    if y_left >= m_left {
+                        state = AffineState::Delete;
+                    } else {
+                        state = AffineState::Match;
+                    }
+                } else if i > 0 {
+                    state = AffineState::Insert;
+                }
                 j -= 1;
             }
         }
@@ -84,8 +134,8 @@ fn build_cigar(query_aligned: &[u8], target_aligned: &[u8]) -> String {
 
     for (q, t) in query_aligned.iter().zip(target_aligned.iter()) {
         let op = match (*q, *t) {
-            (b'-', _) => 'I',
-            (_, b'-') => 'D',
+            (b'-', _) => 'D',
+            (_, b'-') => 'I',
             _ => 'M',
         };
 

@@ -114,7 +114,7 @@ fn test_alignment_result_aligned_sequences() {
 #[test]
 fn test_score_kind_selection_i16() {
     let config = AlignmentConfig::default();
-    let kind = config.required_score_kind(10_000, 10_000);
+    let kind = config.required_score_kind(5000, 5000);
     assert_eq!(kind, ScoreKind::I16);
 }
 
@@ -284,4 +284,68 @@ fn test_large_alignment_saturating_mismatch_tolerance() {
     let result = needleman_wunsch(&query, &target, &config);
     assert!(result.mismatches > 0);
     assert!(result.cigar.len() > 0);
+}
+
+#[test]
+fn test_affine_gap_open_vs_extend() {
+    let query = vec![Base::A, Base::A, Base::A, Base::A, Base::T, Base::C, Base::G];
+    let target = vec![Base::A, Base::T, Base::C, Base::G];
+
+    let mut config = AlignmentConfig::default();
+    config.match_score = 2;
+    config.mismatch_penalty = -3;
+    config.gap_open_penalty = -10;
+    config.gap_extend_penalty = -1;
+
+    let result = needleman_wunsch(&query, &target, &config);
+    assert_eq!(result.insertions, 3);
+    assert_eq!(result.cigar, "3I4M");
+
+    let expected_score: i64 = 4 * 2 + (-10) + 3 * (-1);
+    assert_eq!(result.score, expected_score);
+}
+
+#[test]
+fn test_affine_multiple_gaps_heavier_open_penalty() {
+    let query = vec![Base::A, Base::T, Base::A, Base::A, Base::C, Base::G];
+    let target = vec![Base::A, Base::T, Base::C, Base::G];
+
+    let mut config = AlignmentConfig::default();
+    config.match_score = 2;
+    config.mismatch_penalty = -3;
+    config.gap_open_penalty = -100;
+    config.gap_extend_penalty = -1;
+
+    let result = needleman_wunsch(&query, &target, &config);
+    assert_eq!(result.insertions, 2);
+    assert_eq!(result.deletions, 0);
+
+    let gap_cost: i64 = -100 + 2 * (-1);
+    let expected_score: i64 = 4 * 2 + gap_cost;
+    assert_eq!(result.score, expected_score);
+}
+
+#[test]
+fn test_affine_vs_linear_different_result() {
+    let query = vec![Base::A, Base::A, Base::A, Base::T, Base::C, Base::G];
+    let target = vec![Base::A, Base::T, Base::C, Base::G];
+
+    let mut affine_heavy = AlignmentConfig::default();
+    affine_heavy.match_score = 2;
+    affine_heavy.mismatch_penalty = -3;
+    affine_heavy.gap_open_penalty = -20;
+    affine_heavy.gap_extend_penalty = -1;
+
+    let mut affine_light = AlignmentConfig::default();
+    affine_light.match_score = 2;
+    affine_light.mismatch_penalty = -3;
+    affine_light.gap_open_penalty = -1;
+    affine_light.gap_extend_penalty = -1;
+
+    let r_heavy = needleman_wunsch(&query, &target, &affine_heavy);
+    let r_light = needleman_wunsch(&query, &target, &affine_light);
+
+    assert!(r_heavy.insertions >= 2);
+    assert!(r_light.insertions >= 2);
+    assert!(r_heavy.score < r_light.score);
 }

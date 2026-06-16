@@ -1,6 +1,6 @@
 #[cfg(target_arch = "x86_64")]
 pub mod avx2 {
-    use crate::align::{score_pair, AlignmentConfig, GenericDPMatrix, TraceDirection};
+    use crate::align::{score_pair, AffineState, AlignmentConfig, GenericDPMatrix, TraceDirection};
     use crate::fasta::Base;
     use std::arch::x86_64::*;
 
@@ -14,22 +14,38 @@ pub mod avx2 {
         config: &AlignmentConfig,
     ) {
         let q_base = query[i - 1];
+        let gap_open = config.gap_open_penalty;
         let gap_ext = config.gap_extend_penalty;
-        let gap_ext_vec = _mm256_set1_epi32(gap_ext);
+        let open_plus_ext = gap_open + gap_ext;
         let cols = matrix.cols;
+
+        let gap_ext_vec = _mm256_set1_epi32(gap_ext);
+        let open_plus_ext_vec = _mm256_set1_epi32(open_plus_ext);
 
         let simd_width = 8usize;
         let j_end = cols;
         let j_simd_end = 1 + ((j_end - 1) / simd_width) * simd_width;
 
-        let row_scores_ptr = matrix.scores.as_mut_ptr().add(i * cols);
-        let prev_row_scores_ptr = matrix.scores.as_ptr().add((i - 1) * cols);
+        let row_m_ptr = matrix.mat_m.as_mut_ptr().add(i * cols);
+        let row_x_ptr = matrix.mat_x.as_mut_ptr().add(i * cols);
+        let row_y_ptr = matrix.mat_y.as_mut_ptr().add(i * cols);
         let row_trace_ptr = matrix.traceback.as_mut_ptr().add(i * cols);
+
+        let prev_m_ptr = matrix.mat_m.as_ptr().add((i - 1) * cols);
+        let prev_x_ptr = matrix.mat_x.as_ptr().add((i - 1) * cols);
 
         let mut j = 1usize;
         while j < j_simd_end {
-            let score_diag = _mm256_loadu_si256(prev_row_scores_ptr.add(j - 1) as *const __m256i);
-            let score_up = _mm256_loadu_si256(prev_row_scores_ptr.add(j) as *const __m256i);
+            let prev_m_diag = _mm256_loadu_si256(prev_m_ptr.add(j - 1) as *const __m256i);
+            let prev_x_diag = _mm256_loadu_si256(prev_x_ptr.add(j - 1) as *const __m256i);
+            let prev_y_diag = _mm256_loadu_si256(matrix.mat_y.as_ptr().add((i - 1) * cols).add(j - 1) as *const __m256i);
+
+            let max_mxy = {
+                let m_vs_x = _mm256_cmpgt_epi32(prev_m_diag, prev_x_diag);
+                let best_mx = _mm256_blendv_epi8(prev_x_diag, prev_m_diag, m_vs_x);
+                let mx_vs_y = _mm256_cmpgt_epi32(best_mx, prev_y_diag);
+                _mm256_blendv_epi8(prev_y_diag, best_mx, mx_vs_y)
+            };
 
             let mut sub_scores = [0i32; 8];
             for k in 0..8 {
@@ -37,46 +53,46 @@ pub mod avx2 {
             }
             let sub_vec = _mm256_loadu_si256(sub_scores.as_ptr() as *const __m256i);
 
-            let diag_vec = _mm256_add_epi32(score_diag, sub_vec);
-            let up_vec = _mm256_add_epi32(score_up, gap_ext_vec);
+            let m_new_vec = _mm256_add_epi32(max_mxy, sub_vec);
 
-            let left_base = *row_scores_ptr.add(j - 1);
-            let mut left_arr = [left_base; 8];
-            for k in 0..7 {
-                left_arr[k + 1] = left_arr[k].saturating_add(gap_ext);
+            let prev_m_up = _mm256_loadu_si256(prev_m_ptr.add(j) as *const __m256i);
+            let prev_x_up = _mm256_loadu_si256(prev_x_ptr.add(j) as *const __m256i);
+            let m_plus_open_ext_up = _mm256_add_epi32(prev_m_up, open_plus_ext_vec);
+            let x_plus_ext_up = _mm256_add_epi32(prev_x_up, gap_ext_vec);
+            let x_up_better = _mm256_cmpgt_epi32(m_plus_open_ext_up, x_plus_ext_up);
+            let x_new_vec = _mm256_blendv_epi8(x_plus_ext_up, m_plus_open_ext_up, x_up_better);
+
+            _mm256_storeu_si256(row_m_ptr.add(j) as *mut __m256i, m_new_vec);
+            _mm256_storeu_si256(row_x_ptr.add(j) as *mut __m256i, x_new_vec);
+
+            let mut y_left_arr = [0i32; 8];
+            for k in 0..8 {
+                let jk = j + k;
+                let cand_m_y = (*row_m_ptr.add(jk - 1)).saturating_add(open_plus_ext);
+                let cand_y_y = (*row_y_ptr.add(jk - 1)).saturating_add(gap_ext);
+                let y_val = if cand_m_y >= cand_y_y { cand_m_y } else { cand_y_y };
+                *row_y_ptr.add(jk) = y_val;
+                y_left_arr[k] = y_val;
             }
-            let left_vec = _mm256_loadu_si256(left_arr.as_ptr() as *const __m256i);
 
-            let diag_vs_up = _mm256_cmpgt_epi32(diag_vec, up_vec);
-            let best_du = _mm256_blendv_epi8(up_vec, diag_vec, diag_vs_up);
-
-            let best_du_vs_left = _mm256_cmpgt_epi32(best_du, left_vec);
-            let best = _mm256_blendv_epi8(left_vec, best_du, best_du_vs_left);
-
-            _mm256_storeu_si256(row_scores_ptr.add(j) as *mut __m256i, best);
-
-            let diag_vs_left = _mm256_cmpgt_epi32(diag_vec, left_vec);
-            let diag_best = _mm256_and_si256(diag_vs_up, diag_vs_left);
-
-            let not_diag_vs_up = _mm256_andnot_si256(diag_vs_up, _mm256_set1_epi32(-1));
-            let up_best = _mm256_and_si256(not_diag_vs_up, _mm256_cmpgt_epi32(up_vec, left_vec));
-
-            let mut diag_best_arr = [0i32; 8];
-            let mut up_best_arr = [0i32; 8];
-            _mm256_storeu_si256(diag_best_arr.as_mut_ptr() as *mut __m256i, diag_best);
-            _mm256_storeu_si256(up_best_arr.as_mut_ptr() as *mut __m256i, up_best);
+            let m_new_arr: &mut [i32; 8] = &mut [0i32; 8];
+            let x_new_arr: &mut [i32; 8] = &mut [0i32; 8];
+            _mm256_storeu_si256(m_new_arr.as_mut_ptr() as *mut __m256i, m_new_vec);
+            _mm256_storeu_si256(x_new_arr.as_mut_ptr() as *mut __m256i, x_new_vec);
 
             for k in 0..8 {
-                let d_mask = (diag_best_arr[k] >> 31) & 1;
-                let u_mask = (up_best_arr[k] >> 31) & 1;
-                let dir = if d_mask != 0 {
-                    TraceDirection::Diagonal
-                } else if u_mask != 0 {
-                    TraceDirection::Up
+                let jk = j + k;
+                let m_v = m_new_arr[k];
+                let x_v = x_new_arr[k];
+                let y_v = y_left_arr[k];
+                let best_state = if m_v >= x_v && m_v >= y_v {
+                    AffineState::Match
+                } else if x_v >= y_v {
+                    AffineState::Insert
                 } else {
-                    TraceDirection::Left
+                    AffineState::Delete
                 };
-                *row_trace_ptr.add(j + k) = dir;
+                *row_trace_ptr.add(jk) = TraceDirection { state: best_state };
             }
 
             j += simd_width;
@@ -84,20 +100,39 @@ pub mod avx2 {
 
         while j < j_end {
             let sp = score_pair(q_base, target[j - 1], config);
-            let diag = (*prev_row_scores_ptr.add(j - 1)).saturating_add(sp);
-            let up = (*prev_row_scores_ptr.add(j)).saturating_add(gap_ext);
-            let left = (*row_scores_ptr.add(j - 1)).saturating_add(gap_ext);
 
-            let (best_score, best_dir) = if diag >= up && diag >= left {
-                (diag, TraceDirection::Diagonal)
-            } else if up >= left {
-                (up, TraceDirection::Up)
+            let m_prev = *prev_m_ptr.add(j - 1);
+            let x_prev = *prev_x_ptr.add(j - 1);
+            let y_prev = *matrix.mat_y.as_ptr().add((i - 1) * cols).add(j - 1);
+            let match_from = if m_prev >= x_prev && m_prev >= y_prev {
+                m_prev
+            } else if x_prev >= y_prev {
+                x_prev
             } else {
-                (left, TraceDirection::Left)
+                y_prev
+            };
+            let m_new = match_from.saturating_add(sp);
+
+            let m_up = (*prev_m_ptr.add(j)).saturating_add(open_plus_ext);
+            let x_up = (*prev_x_ptr.add(j)).saturating_add(gap_ext);
+            let x_new = if m_up >= x_up { m_up } else { x_up };
+
+            let m_left = (*row_m_ptr.add(j - 1)).saturating_add(open_plus_ext);
+            let y_left = (*row_y_ptr.add(j - 1)).saturating_add(gap_ext);
+            let y_new = if m_left >= y_left { m_left } else { y_left };
+
+            let best_state = if m_new >= x_new && m_new >= y_new {
+                AffineState::Match
+            } else if x_new >= y_new {
+                AffineState::Insert
+            } else {
+                AffineState::Delete
             };
 
-            *row_scores_ptr.add(j) = best_score;
-            *row_trace_ptr.add(j) = best_dir;
+            *row_m_ptr.add(j) = m_new;
+            *row_x_ptr.add(j) = x_new;
+            *row_y_ptr.add(j) = y_new;
+            *row_trace_ptr.add(j) = TraceDirection { state: best_state };
 
             j += 1;
         }
